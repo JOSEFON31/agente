@@ -54,19 +54,22 @@ class Config:
     min_order_usdt: float = 10.0
 
     # Risk
-    risk_per_trade: float = 0.01       # 1% of equity at stop-loss distance
-    max_position_notional: float = 0.35  # max 35% of equity
+    risk_per_trade_min: float = 0.008
+    risk_per_trade_max: float = 0.02
+    max_position_notional: float = 0.40  # max 40% of equity
     max_daily_drawdown: float = 0.05
     cooldown_steps_after_loss: int = 3
+    min_net_profit_pct_to_exit: float = 0.0022  # ~0.22% to cover buy+sell fees + buffer
 
     # Rewards
     hold_penalty: float = -0.00015
     inaction_penalty: float = -0.00005
     long_hold_penalty: float = -0.001
     reward_scale: float = 4.0
+    equity_growth_reward_scale: float = 15.0  # reward log-growth to favor compounding
 
     # Runtime
-    target_equity: float = float(os.getenv("TARGET_EQUITY", "1000000"))
+    target_equity: float = float(os.getenv("TARGET_EQUITY", "10000000"))
     model_dir: str = "models"
     sleep_seconds: float = 0.8
 
@@ -208,6 +211,7 @@ class TradingEnv:
         self.peak_equity = self.initial_equity
         self.total_profit = 0.0
         self.daily_stop = False
+        self.prev_equity = self.initial_equity
 
     def _fetch(self, limit: int) -> pd.DataFrame:
         klines = safe_api_call(self.client, self.client.get_klines, symbol=CFG.symbol, interval=CFG.interval, limit=limit)
@@ -225,7 +229,11 @@ class TradingEnv:
     def _risk_position_size_usdt(self, price: float, atr_pct: float) -> float:
         if atr_pct <= 0:
             return 0.0
-        max_loss = self.equity * CFG.risk_per_trade
+
+        progress = min(max(self.equity / max(CFG.target_equity, 1e-9), 0.0), 1.0)
+        dynamic_risk = CFG.risk_per_trade_min + (CFG.risk_per_trade_max - CFG.risk_per_trade_min) * progress
+
+        max_loss = self.equity * dynamic_risk
         stop_distance = max(abs(CFG.stop_loss), atr_pct * 1.5)
         raw_notional = max_loss / stop_distance
         capped_notional = min(raw_notional, self.equity * CFG.max_position_notional)
@@ -291,11 +299,15 @@ class TradingEnv:
         )
 
     def step(self, action: int):
+        prev_equity = max(self.equity, 1e-9)
         self.update()
         row = self.df.iloc[self.step_idx]
         price = float(row.close)
         atr_pct = float(max(row.atr_pct, 1e-6))
         reward = 0.0
+
+        equity_growth = np.log(max(self.equity, 1e-9) / prev_equity)
+        reward += equity_growth * CFG.equity_growth_reward_scale
 
         if self.daily_stop:
             return self.state(), -1.0, True
@@ -313,7 +325,7 @@ class TradingEnv:
                 qty = float(order["executedQty"])
                 cost = float(order["cummulativeQuoteQty"])
                 fee_in = cost * CFG.taker_fee
-                self.entry = {"price": price, "qty": qty, "cost": cost + fee_in}
+                self.entry = {"price": price, "qty": qty, "cost": cost, "fee_in": fee_in}
                 self.in_position = True
                 self.hold_steps = 0
                 print(f"🟢 BUY {qty:.6f} BTC @ ${price:,.2f} | Notional ${cost:,.2f}")
@@ -324,23 +336,28 @@ class TradingEnv:
             if self.hold_steps > 12:
                 reward += CFG.long_hold_penalty
 
-            pnl_gross = price * self.entry["qty"] - self.entry["cost"]
-            fee_out = price * self.entry["qty"] * CFG.taker_fee
-            pnl_net = pnl_gross - fee_out
+            notional_now = price * self.entry["qty"]
+            fee_out = notional_now * CFG.taker_fee
+            pnl_gross = notional_now - self.entry["cost"]
+            pnl_net = pnl_gross - self.entry["fee_in"] - fee_out
             pnl_pct = (price - self.entry["price"]) / self.entry["price"]
+            net_pnl_pct = pnl_net / max(self.entry["cost"], 1e-9)
 
-            should_close = (
-                pnl_pct >= CFG.take_profit
-                or pnl_pct <= CFG.stop_loss
-                or self.hold_steps >= CFG.max_hold_steps
-                or action == 2
-            )
+            profit_exit = pnl_pct >= CFG.take_profit and net_pnl_pct >= CFG.min_net_profit_pct_to_exit
+            risk_exit = pnl_pct <= CFG.stop_loss or self.hold_steps >= CFG.max_hold_steps
+            policy_exit = action == 2 and net_pnl_pct >= CFG.min_net_profit_pct_to_exit
+            should_close = profit_exit or risk_exit or policy_exit
 
             if should_close:
                 self._sell_market(self.entry["qty"])
-                print(f"🔴 SELL {self.entry['qty']:.6f} BTC @ ${price:,.2f} | PnL ${pnl_net:+,.2f} ({pnl_pct:+.2%})")
+                fees_total = self.entry["fee_in"] + fee_out
+                print(
+                    f"🔴 SELL {self.entry['qty']:.6f} BTC @ ${price:,.2f} "
+                    f"| Gross ${pnl_gross:+,.2f} | Fees ${fees_total:,.2f} "
+                    f"| Net ${pnl_net:+,.2f} | Net% {net_pnl_pct:+.3%}"
+                )
 
-                # Stable reward shaping: positive pnl => positive reward, negative pnl => negative reward.
+                # Reward net realized return and penalize losses to reinforce better decision quality.
                 reward += (pnl_net / max(self.initial_equity, 1e-9)) * CFG.reward_scale
 
                 if pnl_net < 0:
