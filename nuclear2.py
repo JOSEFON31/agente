@@ -40,7 +40,7 @@ class Config:
     min_replay_for_train: int = 2_000
     eps_start: float = 0.20
     eps_end: float = 0.02
-    eps_decay: float = 0.999
+    eps_decay: float = 0.997
     target_update_tau: float = 0.01
     per_alpha: float = 0.6
     per_beta_start: float = 0.4
@@ -52,7 +52,7 @@ class Config:
     interval: str = Client.KLINE_INTERVAL_1MINUTE
     history_bars: int = 300
     taker_fee: float = 0.001
-    take_profit: float = 0.008
+    take_profit: float = 0.010
     stop_loss: float = -0.012
     max_hold_steps: int = 25
     min_order_usdt: float = 10.0
@@ -63,7 +63,11 @@ class Config:
     max_position_notional: float = 0.40  # max 40% of equity
     max_daily_drawdown: float = 0.05
     cooldown_steps_after_loss: int = 3
-    min_net_profit_pct_to_exit: float = 0.0022  # ~0.22% to cover buy+sell fees + buffer
+    min_net_profit_pct_to_exit: float = 0.0025  # ~0.25% net target to beat fee drag
+    min_hold_steps: int = 3
+    post_sell_cooldown_steps: int = 4
+    min_entry_atr_pct: float = 0.0012
+    min_entry_trend: float = 0.00012
 
     # Rewards
     hold_penalty: float = -0.00015
@@ -246,6 +250,7 @@ class TradingEnv:
         self.entry: Optional[dict] = None
         self.hold_steps = 0
         self.loss_cooldown = 0
+        self.trade_cooldown = 0
 
         self.usdt_balance = 0.0
         self.btc_balance = 0.0
@@ -394,8 +399,13 @@ class TradingEnv:
             reward += CFG.inaction_penalty
             if self.loss_cooldown > 0:
                 self.loss_cooldown -= 1
+            if self.trade_cooldown > 0:
+                self.trade_cooldown -= 1
 
-        if (not self.in_position) and action == 1 and self.loss_cooldown == 0:
+        trend = (float(row.ema_fast) - float(row.ema_slow)) / max(price, 1e-9)
+        entry_signal_ok = (atr_pct >= CFG.min_entry_atr_pct) and (trend >= CFG.min_entry_trend)
+
+        if (not self.in_position) and action == 1 and self.loss_cooldown == 0 and self.trade_cooldown == 0 and entry_signal_ok:
             usdt = self.usdt_balance
             size_usdt = min(usdt, self._risk_position_size_usdt(price, atr_pct))
             if size_usdt >= CFG.min_order_usdt:
@@ -425,7 +435,11 @@ class TradingEnv:
 
             profit_exit = pnl_pct >= CFG.take_profit and net_pnl_pct >= CFG.min_net_profit_pct_to_exit
             risk_exit = pnl_pct <= CFG.stop_loss or self.hold_steps >= CFG.max_hold_steps
-            policy_exit = action == 2 and net_pnl_pct >= CFG.min_net_profit_pct_to_exit
+            policy_exit = (
+                action == 2
+                and self.hold_steps >= CFG.min_hold_steps
+                and net_pnl_pct >= CFG.min_net_profit_pct_to_exit
+            )
             should_close = profit_exit or risk_exit or policy_exit
 
             if should_close:
@@ -444,6 +458,7 @@ class TradingEnv:
 
                 if pnl_net < 0:
                     self.loss_cooldown = CFG.cooldown_steps_after_loss
+                self.trade_cooldown = CFG.post_sell_cooldown_steps
 
                 self.in_position = False
                 self.entry = None
