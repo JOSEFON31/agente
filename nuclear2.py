@@ -353,6 +353,29 @@ class TradingEnv:
         return self.state(), float(reward), False
 
 
+
+
+def load_checkpoint_compatible(model: nn.Module, checkpoint_path: str) -> tuple[int, int]:
+    """Load only checkpoint tensors with matching key+shape.
+
+    Returns: (loaded_tensor_count, skipped_tensor_count).
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+    model_state = model.state_dict()
+
+    compatible = {}
+    skipped = 0
+    for key, value in checkpoint.items():
+        if key in model_state and model_state[key].shape == value.shape:
+            compatible[key] = value
+        else:
+            skipped += 1
+
+    model_state.update(compatible)
+    model.load_state_dict(model_state)
+    return len(compatible), skipped
+
+
 def select_action(model: nn.Module, state: np.ndarray, eps: float) -> int:
     if random.random() < eps:
         return random.randrange(CFG.action_dim)
@@ -373,8 +396,8 @@ def main() -> None:
     checkpoints = sorted([f for f in os.listdir(CFG.model_dir) if f.endswith(".pt")])
     if checkpoints:
         latest = os.path.join(CFG.model_dir, checkpoints[-1])
-        model.load_state_dict(torch.load(latest, map_location=DEVICE))
-        print(f"✅ Loaded checkpoint: {latest}")
+        loaded, skipped = load_checkpoint_compatible(model, latest)
+        print(f"✅ Loaded checkpoint: {latest} | tensors loaded={loaded}, skipped={skipped}")
 
     target_model.load_state_dict(model.state_dict())
     optimizer = optim.AdamW(model.parameters(), lr=CFG.lr)
