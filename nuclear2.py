@@ -72,6 +72,7 @@ class Config:
     target_equity: float = float(os.getenv("TARGET_EQUITY", "10000000"))
     model_dir: str = "models"
     sleep_seconds: float = 0.8
+    idle_sleep_seconds: float = 0.25
 
 
 CFG = Config()
@@ -239,8 +240,21 @@ class TradingEnv:
         capped_notional = min(raw_notional, self.equity * CFG.max_position_notional)
         return max(0.0, capped_notional)
 
-    def update(self) -> None:
+    def update(self) -> bool:
         new = self._fetch(1)
+        last_ts = int(self.df.iloc[-1].t)
+        new_ts = int(new.iloc[-1].t)
+
+        if new_ts <= last_ts:
+            # Same in-progress candle: refresh equity only, avoid duplicated transitions.
+            self.equity = self._equity()
+            self.total_profit = self.equity - self.initial_equity
+            self.peak_equity = max(self.peak_equity, self.equity)
+            drawdown = 1 - (self.equity / self.peak_equity)
+            if drawdown >= CFG.max_daily_drawdown:
+                self.daily_stop = True
+            return False
+
         self.df = pd.concat([self.df, new]).tail(CFG.history_bars).reset_index(drop=True)
         self.df = calculate_indicators(self.df)
         self.step_idx = len(self.df) - 1
@@ -251,6 +265,7 @@ class TradingEnv:
         drawdown = 1 - (self.equity / self.peak_equity)
         if drawdown >= CFG.max_daily_drawdown:
             self.daily_stop = True
+        return True
 
     def state(self) -> np.ndarray:
         r = self.df.iloc[self.step_idx]
@@ -300,7 +315,10 @@ class TradingEnv:
 
     def step(self, action: int):
         prev_equity = max(self.equity, 1e-9)
-        self.update()
+        advanced = self.update()
+        if not advanced:
+            return self.state(), 0.0, False, False
+
         row = self.df.iloc[self.step_idx]
         price = float(row.close)
         atr_pct = float(max(row.atr_pct, 1e-6))
@@ -310,7 +328,7 @@ class TradingEnv:
         reward += equity_growth * CFG.equity_growth_reward_scale
 
         if self.daily_stop:
-            return self.state(), -1.0, True
+            return self.state(), -1.0, True, True
 
         if not self.in_position:
             reward += CFG.inaction_penalty
@@ -367,7 +385,7 @@ class TradingEnv:
                 self.entry = None
                 self.hold_steps = 0
 
-        return self.state(), float(reward), False
+        return self.state(), float(reward), False, True
 
 
 
@@ -444,7 +462,12 @@ def main() -> None:
 
     while True:
         action = select_action(model, state, epsilon)
-        next_state, reward, done = env.step(action)
+        next_state, reward, done, advanced = env.step(action)
+
+        if not advanced:
+            time.sleep(CFG.idle_sleep_seconds)
+            continue
+
         memory.push(state, action, reward, next_state, float(done))
         state = next_state
         steps += 1
