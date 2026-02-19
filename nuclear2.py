@@ -359,20 +359,32 @@ def load_checkpoint_compatible(model: nn.Module, checkpoint_path: str) -> tuple[
     """Load only checkpoint tensors with matching key+shape.
 
     Returns: (loaded_tensor_count, skipped_tensor_count).
+    Never raises due to architecture mismatch; incompatible tensors are skipped.
     """
-    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+    raw = torch.load(checkpoint_path, map_location=DEVICE)
+
+    # Support both plain state_dict files and wrapped checkpoints.
+    if isinstance(raw, dict) and "state_dict" in raw and isinstance(raw["state_dict"], dict):
+        checkpoint = raw["state_dict"]
+    else:
+        checkpoint = raw
+
+    if not isinstance(checkpoint, dict):
+        print(f"⚠ Checkpoint format not supported: {checkpoint_path}")
+        return 0, 0
+
     model_state = model.state_dict()
 
     compatible = {}
     skipped = 0
     for key, value in checkpoint.items():
-        if key in model_state and model_state[key].shape == value.shape:
+        if key in model_state and hasattr(value, "shape") and model_state[key].shape == value.shape:
             compatible[key] = value
         else:
             skipped += 1
 
     model_state.update(compatible)
-    model.load_state_dict(model_state)
+    model.load_state_dict(model_state, strict=False)
     return len(compatible), skipped
 
 
@@ -396,8 +408,11 @@ def main() -> None:
     checkpoints = sorted([f for f in os.listdir(CFG.model_dir) if f.endswith(".pt")])
     if checkpoints:
         latest = os.path.join(CFG.model_dir, checkpoints[-1])
-        loaded, skipped = load_checkpoint_compatible(model, latest)
-        print(f"✅ Loaded checkpoint: {latest} | tensors loaded={loaded}, skipped={skipped}")
+        try:
+            loaded, skipped = load_checkpoint_compatible(model, latest)
+            print(f"✅ Loaded checkpoint: {latest} | tensors loaded={loaded}, skipped={skipped}")
+        except Exception as exc:
+            print(f"⚠ Failed to load checkpoint ({latest}), continuing with fresh weights: {exc}")
 
     target_model.load_state_dict(model.state_dict())
     optimizer = optim.AdamW(model.parameters(), lr=CFG.lr)
