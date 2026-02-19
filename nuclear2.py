@@ -14,7 +14,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
-from typing import Deque, Optional, Tuple
+from typing import Deque, Optional, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -42,6 +42,10 @@ class Config:
     eps_end: float = 0.02
     eps_decay: float = 0.999
     target_update_tau: float = 0.01
+    per_alpha: float = 0.6
+    per_beta_start: float = 0.4
+    per_beta_frames: int = 200_000
+    per_epsilon: float = 1e-5
 
     # Trading
     symbol: str = os.getenv("SYMBOL", "BTCUSDT")
@@ -75,7 +79,7 @@ class Config:
     sleep_seconds: float = 0.8
     idle_sleep_seconds: float = 0.25
     balance_refresh_steps: int = 5
-    train_updates_per_step: int = 2
+    train_updates_per_step: int = 4
     log_every_n_steps: int = 5
 
 
@@ -154,23 +158,54 @@ class DuelingDQN(nn.Module):
         return v + a - a.mean(dim=1, keepdim=True)
 
 
-class ReplayBuffer:
-    def __init__(self, cap: int) -> None:
-        self.buffer: Deque[Tuple[np.ndarray, int, float, np.ndarray, float]] = deque(maxlen=cap)
+class PrioritizedReplayBuffer:
+    def __init__(self, cap: int, alpha: float) -> None:
+        self.cap = cap
+        self.alpha = alpha
+        self.buffer: List[Tuple[np.ndarray, int, float, np.ndarray, float]] = []
+        self.priorities = np.zeros((cap,), dtype=np.float32)
+        self.pos = 0
 
     def push(self, *args) -> None:
-        self.buffer.append(args)
+        max_prio = self.priorities.max() if self.buffer else 1.0
+        if len(self.buffer) < self.cap:
+            self.buffer.append(args)
+        else:
+            self.buffer[self.pos] = args
+        self.priorities[self.pos] = max_prio
+        self.pos = (self.pos + 1) % self.cap
 
-    def sample(self, batch: int):
-        samples = random.sample(self.buffer, batch)
+    def sample(self, batch: int, beta: float):
+        if len(self.buffer) == self.cap:
+            prios = self.priorities
+        else:
+            prios = self.priorities[:len(self.buffer)]
+
+        probs = prios ** self.alpha
+        probs /= probs.sum()
+
+        indices = np.random.choice(len(self.buffer), batch, p=probs)
+        samples = [self.buffer[idx] for idx in indices]
+
         states, actions, rewards, next_states, dones = zip(*samples)
+
+        total = len(self.buffer)
+        weights = (total * probs[indices]) ** (-beta)
+        weights /= weights.max()
+
         return (
             np.array(states, dtype=np.float32),
             np.array(actions, dtype=np.int64),
             np.array(rewards, dtype=np.float32),
             np.array(next_states, dtype=np.float32),
             np.array(dones, dtype=np.float32),
+            np.array(indices, dtype=np.int64),
+            np.array(weights, dtype=np.float32),
         )
+
+    def update_priorities(self, indices: np.ndarray, td_errors: np.ndarray) -> None:
+        for idx, td_err in zip(indices, td_errors):
+            self.priorities[idx] = abs(float(td_err)) + CFG.per_epsilon
 
     def __len__(self) -> int:
         return len(self.buffer)
@@ -497,7 +532,7 @@ def main() -> None:
 
     target_model.load_state_dict(model.state_dict())
     optimizer = optim.AdamW(model.parameters(), lr=CFG.lr)
-    memory = ReplayBuffer(CFG.buffer_size)
+    memory = PrioritizedReplayBuffer(CFG.buffer_size, CFG.per_alpha)
 
     env = TradingEnv(client)
     epsilon = CFG.eps_start
@@ -519,25 +554,30 @@ def main() -> None:
         steps += 1
 
         if len(memory) >= CFG.min_replay_for_train:
+            beta = min(1.0, CFG.per_beta_start + (1.0 - CFG.per_beta_start) * (steps / max(CFG.per_beta_frames, 1)))
             for _ in range(CFG.train_updates_per_step):
-                states, actions, rewards, next_states, dones = memory.sample(CFG.batch_size)
+                states, actions, rewards, next_states, dones, indices, weights = memory.sample(CFG.batch_size, beta)
                 s = torch.from_numpy(states).to(DEVICE)
                 ns = torch.from_numpy(next_states).to(DEVICE)
                 a = torch.from_numpy(actions).long().to(DEVICE)
                 r = torch.from_numpy(rewards).to(DEVICE)
                 d = torch.from_numpy(dones).to(DEVICE)
+                w = torch.from_numpy(weights).to(DEVICE)
 
                 q = model(s).gather(1, a.unsqueeze(1)).squeeze(1)
                 next_actions = model(ns).argmax(1)
                 next_q = target_model(ns).gather(1, next_actions.unsqueeze(1)).squeeze(1)
                 target = r + (1.0 - d) * CFG.gamma * next_q
 
-                loss = nn.SmoothL1Loss()(q, target.detach())
+                td_error = target.detach() - q
+                loss = (w * nn.SmoothL1Loss(reduction="none")(q, target.detach())).mean()
                 optimizer.zero_grad()
                 loss.backward()
                 clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 soft_update(target_model, model, CFG.target_update_tau)
+
+                memory.update_priorities(indices, td_error.detach().abs().cpu().numpy())
 
         epsilon = max(CFG.eps_end, epsilon * CFG.eps_decay)
         progress = (env.equity / max(CFG.target_equity, 1e-9)) * 100

@@ -36,13 +36,17 @@ BUFFER_SIZE = 150_000
 MIN_REPLAY_FOR_TRAIN = 1_000
 TARGET_UPDATE_TAU = 0.01
 GRAD_CLIP = 1.2
+PER_ALPHA = 0.6
+PER_BETA_START = 0.4
+PER_BETA_FRAMES = 1_000_000
+PER_EPS = 1e-5
 
 EPS_START = 0.98
 EPS_END = 0.01
 EPS_DECAY = 0.9992
 
 NUM_EPISODES = int(os.getenv("OFFLINE_EPISODES", "2000"))
-TRAIN_EVERY_N_STEPS = 3
+TRAIN_EVERY_N_STEPS = 2
 DATA_FILE = os.getenv("OFFLINE_DATA_FILE", "btc_usdt_1m_con_indicadores.parquet")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -83,29 +87,59 @@ target_model.load_state_dict(model.state_dict())
 optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-5)
 
 
-class ReplayBuffer:
-    def __init__(self, capacity: int) -> None:
-        self.buffer: Deque[Tuple[np.ndarray, int, float, np.ndarray, float]] = deque(maxlen=capacity)
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity: int, alpha: float):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.buffer: list[Tuple[np.ndarray, int, float, np.ndarray, float]] = []
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
+        self.pos = 0
 
-    def push(self, *args) -> None:
-        self.buffer.append(args)
+    def push(self, *args):
+        max_prio = self.priorities.max() if self.buffer else 1.0
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(args)
+        else:
+            self.buffer[self.pos] = args
+        self.priorities[self.pos] = max_prio
+        self.pos = (self.pos + 1) % self.capacity
 
-    def sample(self, batch_size: int):
-        batch = random.sample(self.buffer, batch_size)
+    def sample(self, batch_size: int, beta: float):
+        if len(self.buffer) == self.capacity:
+            prios = self.priorities
+        else:
+            prios = self.priorities[:len(self.buffer)]
+
+        probs = prios ** self.alpha
+        probs /= probs.sum()
+
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+        batch = [self.buffer[i] for i in indices]
         s, a, r, ns, d = zip(*batch)
+
+        total = len(self.buffer)
+        weights = (total * probs[indices]) ** (-beta)
+        weights /= weights.max()
+
         return (
             np.array(s, dtype=np.float32),
             np.array(a, dtype=np.int64),
             np.array(r, dtype=np.float32),
             np.array(ns, dtype=np.float32),
             np.array(d, dtype=np.float32),
+            np.array(indices, dtype=np.int64),
+            np.array(weights, dtype=np.float32),
         )
+
+    def update_priorities(self, indices: np.ndarray, td_errors: np.ndarray) -> None:
+        for idx, td_err in zip(indices, td_errors):
+            self.priorities[idx] = abs(float(td_err)) + PER_EPS
 
     def __len__(self) -> int:
         return len(self.buffer)
 
 
-memory = ReplayBuffer(BUFFER_SIZE)
+memory = PrioritizedReplayBuffer(BUFFER_SIZE, PER_ALPHA)
 
 
 def normalize_state(features: list) -> np.ndarray:
@@ -302,25 +336,30 @@ def main() -> None:
             global_step += 1
 
             if len(memory) >= MIN_REPLAY_FOR_TRAIN and ep_len % TRAIN_EVERY_N_STEPS == 0:
-                states, actions, rewards, next_states, dones = memory.sample(BATCH_SIZE)
+                beta = min(1.0, PER_BETA_START + (1.0 - PER_BETA_START) * (global_step / max(PER_BETA_FRAMES, 1)))
+                states, actions, rewards, next_states, dones, idxs, weights = memory.sample(BATCH_SIZE, beta)
 
                 s = torch.from_numpy(states).to(DEVICE)
                 ns = torch.from_numpy(next_states).to(DEVICE)
                 a = torch.from_numpy(actions).long().to(DEVICE)
                 r = torch.from_numpy(rewards).to(DEVICE)
                 d = torch.from_numpy(dones).to(DEVICE)
+                w = torch.from_numpy(weights).to(DEVICE)
 
                 q = model(s).gather(1, a.unsqueeze(1)).squeeze(1)
                 next_actions = model(ns).detach().argmax(1)
                 next_q = target_model(ns).detach().gather(1, next_actions.unsqueeze(1)).squeeze(1)
                 expected = r + GAMMA * next_q * (1.0 - d)
 
-                loss = nn.SmoothL1Loss()(q, expected)
+                td_error = expected.detach() - q
+                loss = (w * nn.SmoothL1Loss(reduction="none")(q, expected.detach())).mean()
                 optimizer.zero_grad()
                 loss.backward()
                 clip_grad_norm_(model.parameters(), GRAD_CLIP)
                 optimizer.step()
                 soft_update(target_model, model)
+
+                memory.update_priorities(idxs, td_error.detach().abs().cpu().numpy())
 
         epsilon = max(EPS_END, EPS_START * (EPS_DECAY ** ep))
         ep_rewards.append(ep_reward)
