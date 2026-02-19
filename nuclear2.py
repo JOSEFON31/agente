@@ -74,6 +74,9 @@ class Config:
     warm_start_model_path: str = os.getenv("WARM_START_MODEL_PATH", "")
     sleep_seconds: float = 0.8
     idle_sleep_seconds: float = 0.25
+    balance_refresh_steps: int = 5
+    train_updates_per_step: int = 2
+    log_every_n_steps: int = 5
 
 
 CFG = Config()
@@ -208,7 +211,13 @@ class TradingEnv:
         self.hold_steps = 0
         self.loss_cooldown = 0
 
-        self.initial_equity = self._equity()
+        self.usdt_balance = 0.0
+        self.btc_balance = 0.0
+        self.steps_since_balance_refresh = 0
+        bootstrap_price = float(self.df.iloc[self.step_idx].close)
+        self._refresh_balances()
+
+        self.initial_equity = self._equity(bootstrap_price)
         self.equity = self.initial_equity
         self.peak_equity = self.initial_equity
         self.total_profit = 0.0
@@ -222,11 +231,13 @@ class TradingEnv:
         df = df.rename(columns={"o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"})
         return df
 
-    def _equity(self) -> float:
-        usdt = float(safe_api_call(self.client, self.client.get_asset_balance, asset="USDT")["free"])
-        btc = float(safe_api_call(self.client, self.client.get_asset_balance, asset="BTC")["free"])
-        price = float(safe_api_call(self.client, self.client.get_symbol_ticker, symbol=CFG.symbol)["price"])
-        return usdt + btc * price
+    def _refresh_balances(self) -> None:
+        self.usdt_balance = float(safe_api_call(self.client, self.client.get_asset_balance, asset="USDT")["free"])
+        self.btc_balance = float(safe_api_call(self.client, self.client.get_asset_balance, asset="BTC")["free"])
+        self.steps_since_balance_refresh = 0
+
+    def _equity(self, price: float) -> float:
+        return self.usdt_balance + self.btc_balance * price
 
     def _risk_position_size_usdt(self, price: float, atr_pct: float) -> float:
         if atr_pct <= 0:
@@ -248,7 +259,8 @@ class TradingEnv:
 
         if new_ts <= last_ts:
             # Same in-progress candle: refresh equity only, avoid duplicated transitions.
-            self.equity = self._equity()
+            last_price = float(self.df.iloc[-1].close)
+            self.equity = self._equity(last_price)
             self.total_profit = self.equity - self.initial_equity
             self.peak_equity = max(self.peak_equity, self.equity)
             drawdown = 1 - (self.equity / self.peak_equity)
@@ -259,7 +271,13 @@ class TradingEnv:
         self.df = pd.concat([self.df, new]).tail(CFG.history_bars).reset_index(drop=True)
         self.df = calculate_indicators(self.df)
         self.step_idx = len(self.df) - 1
-        self.equity = self._equity()
+
+        self.steps_since_balance_refresh += 1
+        if self.steps_since_balance_refresh >= CFG.balance_refresh_steps:
+            self._refresh_balances()
+
+        price = float(self.df.iloc[self.step_idx].close)
+        self.equity = self._equity(price)
         self.total_profit = self.equity - self.initial_equity
         self.peak_equity = max(self.peak_equity, self.equity)
 
@@ -337,7 +355,7 @@ class TradingEnv:
                 self.loss_cooldown -= 1
 
         if (not self.in_position) and action == 1 and self.loss_cooldown == 0:
-            usdt = float(safe_api_call(self.client, self.client.get_asset_balance, asset="USDT")["free"])
+            usdt = self.usdt_balance
             size_usdt = min(usdt, self._risk_position_size_usdt(price, atr_pct))
             if size_usdt >= CFG.min_order_usdt:
                 order = self._buy_market(size_usdt)
@@ -345,6 +363,8 @@ class TradingEnv:
                 cost = float(order["cummulativeQuoteQty"])
                 fee_in = cost * CFG.taker_fee
                 self.entry = {"price": price, "qty": qty, "cost": cost, "fee_in": fee_in}
+                self.usdt_balance = max(0.0, self.usdt_balance - (cost + fee_in))
+                self.btc_balance += qty
                 self.in_position = True
                 self.hold_steps = 0
                 print(f"🟢 BUY {qty:.6f} BTC @ ${price:,.2f} | Notional ${cost:,.2f}")
@@ -370,6 +390,8 @@ class TradingEnv:
             if should_close:
                 self._sell_market(self.entry["qty"])
                 fees_total = self.entry["fee_in"] + fee_out
+                self.usdt_balance += max(0.0, notional_now - fee_out)
+                self.btc_balance = max(0.0, self.btc_balance - self.entry["qty"])
                 print(
                     f"🔴 SELL {self.entry['qty']:.6f} BTC @ ${price:,.2f} "
                     f"| Gross ${pnl_gross:+,.2f} | Fees ${fees_total:,.2f} "
@@ -497,31 +519,33 @@ def main() -> None:
         steps += 1
 
         if len(memory) >= CFG.min_replay_for_train:
-            states, actions, rewards, next_states, dones = memory.sample(CFG.batch_size)
-            s = torch.from_numpy(states).to(DEVICE)
-            ns = torch.from_numpy(next_states).to(DEVICE)
-            a = torch.from_numpy(actions).long().to(DEVICE)
-            r = torch.from_numpy(rewards).to(DEVICE)
-            d = torch.from_numpy(dones).to(DEVICE)
+            for _ in range(CFG.train_updates_per_step):
+                states, actions, rewards, next_states, dones = memory.sample(CFG.batch_size)
+                s = torch.from_numpy(states).to(DEVICE)
+                ns = torch.from_numpy(next_states).to(DEVICE)
+                a = torch.from_numpy(actions).long().to(DEVICE)
+                r = torch.from_numpy(rewards).to(DEVICE)
+                d = torch.from_numpy(dones).to(DEVICE)
 
-            q = model(s).gather(1, a.unsqueeze(1)).squeeze(1)
-            next_actions = model(ns).argmax(1)
-            next_q = target_model(ns).gather(1, next_actions.unsqueeze(1)).squeeze(1)
-            target = r + (1.0 - d) * CFG.gamma * next_q
+                q = model(s).gather(1, a.unsqueeze(1)).squeeze(1)
+                next_actions = model(ns).argmax(1)
+                next_q = target_model(ns).gather(1, next_actions.unsqueeze(1)).squeeze(1)
+                target = r + (1.0 - d) * CFG.gamma * next_q
 
-            loss = nn.SmoothL1Loss()(q, target.detach())
-            optimizer.zero_grad()
-            loss.backward()
-            clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            soft_update(target_model, model, CFG.target_update_tau)
+                loss = nn.SmoothL1Loss()(q, target.detach())
+                optimizer.zero_grad()
+                loss.backward()
+                clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                soft_update(target_model, model, CFG.target_update_tau)
 
         epsilon = max(CFG.eps_end, epsilon * CFG.eps_decay)
         progress = (env.equity / max(CFG.target_equity, 1e-9)) * 100
-        print(
-            f"Step {steps} | Eq ${env.equity:,.2f} | PnL ${env.total_profit:+,.2f} "
-            f"| DD {(1 - env.equity / max(env.peak_equity, 1e-9)):.2%} | {progress:.4f}% | eps {epsilon:.3f}"
-        )
+        if steps % CFG.log_every_n_steps == 0:
+            print(
+                f"Step {steps} | Eq ${env.equity:,.2f} | PnL ${env.total_profit:+,.2f} "
+                f"| DD {(1 - env.equity / max(env.peak_equity, 1e-9)):.2%} | {progress:.4f}% | eps {epsilon:.3f}"
+            )
 
         if done:
             print("🛑 Trading halted due to max drawdown control.")
