@@ -68,6 +68,10 @@ class Config:
     post_sell_cooldown_steps: int = 4
     min_entry_atr_pct: float = 0.0012
     min_entry_trend: float = 0.00012
+    min_entry_rsi: float = 0.52
+    min_entry_volume_z: float = -0.10
+    min_win_rate_for_full_risk: float = 0.55
+    low_edge_risk_multiplier: float = 0.55
 
     # Rewards
     hold_penalty: float = -0.00015
@@ -75,6 +79,8 @@ class Config:
     long_hold_penalty: float = -0.001
     reward_scale: float = 4.0
     equity_growth_reward_scale: float = 15.0  # reward log-growth to favor compounding
+    drawdown_penalty_scale: float = 1.2
+    downside_penalty_scale: float = 2.0
 
     # Runtime
     target_equity: float = float(os.getenv("TARGET_EQUITY", "10000000"))
@@ -265,6 +271,8 @@ class TradingEnv:
         self.daily_stop = False
         self.prev_equity = self.initial_equity
         self.has_processed_live_bar = False
+        self.recent_trade_results = deque(maxlen=40)
+        self.recent_equity_returns = deque(maxlen=120)
 
     def _fetch(self, limit: int) -> pd.DataFrame:
         klines = safe_api_call(self.client, self.client.get_klines, symbol=CFG.symbol, interval=CFG.interval, limit=limit)
@@ -281,6 +289,19 @@ class TradingEnv:
     def _equity(self, price: float) -> float:
         return self.usdt_balance + self.btc_balance * price
 
+    def _current_win_rate(self) -> float:
+        if not self.recent_trade_results:
+            return 0.5
+        wins = sum(1 for x in self.recent_trade_results if x > 0)
+        return wins / len(self.recent_trade_results)
+
+    def _edge_risk_multiplier(self) -> float:
+        win_rate = self._current_win_rate()
+        if win_rate >= CFG.min_win_rate_for_full_risk:
+            return 1.0
+        gap = (CFG.min_win_rate_for_full_risk - win_rate) / max(CFG.min_win_rate_for_full_risk, 1e-9)
+        return max(CFG.low_edge_risk_multiplier, 1.0 - gap)
+
     def _risk_position_size_usdt(self, price: float, atr_pct: float) -> float:
         if atr_pct <= 0:
             return 0.0
@@ -288,7 +309,7 @@ class TradingEnv:
         progress = min(max(self.equity / max(CFG.target_equity, 1e-9), 0.0), 1.0)
         dynamic_risk = CFG.risk_per_trade_min + (CFG.risk_per_trade_max - CFG.risk_per_trade_min) * progress
 
-        max_loss = self.equity * dynamic_risk
+        max_loss = self.equity * dynamic_risk * self._edge_risk_multiplier()
         stop_distance = max(abs(CFG.stop_loss), atr_pct * 1.5)
         raw_notional = max_loss / stop_distance
         capped_notional = min(raw_notional, self.equity * CFG.max_position_notional)
@@ -390,7 +411,13 @@ class TradingEnv:
         reward = 0.0
 
         equity_growth = np.log(max(self.equity, 1e-9) / prev_equity)
+        self.recent_equity_returns.append(equity_growth)
         reward += equity_growth * CFG.equity_growth_reward_scale
+
+        drawdown_now = 1 - (self.equity / max(self.peak_equity, 1e-9))
+        reward -= drawdown_now * CFG.drawdown_penalty_scale
+        if equity_growth < 0:
+            reward += equity_growth * CFG.downside_penalty_scale
 
         if self.daily_stop:
             return self.state(), -1.0, True, True
@@ -403,7 +430,14 @@ class TradingEnv:
                 self.trade_cooldown -= 1
 
         trend = (float(row.ema_fast) - float(row.ema_slow)) / max(price, 1e-9)
-        entry_signal_ok = (atr_pct >= CFG.min_entry_atr_pct) and (trend >= CFG.min_entry_trend)
+        rsi = float(row.rsi) / 100.0
+        volume_z = float(row.volume_z)
+        entry_signal_ok = (
+            (atr_pct >= CFG.min_entry_atr_pct)
+            and (trend >= CFG.min_entry_trend)
+            and (rsi >= CFG.min_entry_rsi)
+            and (volume_z >= CFG.min_entry_volume_z)
+        )
 
         if (not self.in_position) and action == 1 and self.loss_cooldown == 0 and self.trade_cooldown == 0 and entry_signal_ok:
             usdt = self.usdt_balance
@@ -456,6 +490,7 @@ class TradingEnv:
                 # Reward net realized return and penalize losses to reinforce better decision quality.
                 reward += (pnl_net / max(self.initial_equity, 1e-9)) * CFG.reward_scale
 
+                self.recent_trade_results.append(pnl_net)
                 if pnl_net < 0:
                     self.loss_cooldown = CFG.cooldown_steps_after_loss
                 self.trade_cooldown = CFG.post_sell_cooldown_steps
@@ -611,7 +646,8 @@ def main() -> None:
         if steps % CFG.log_every_n_steps == 0:
             print(
                 f"Step {steps} | Eq ${env.equity:,.2f} | PnL ${env.total_profit:+,.2f} "
-                f"| DD {(1 - env.equity / max(env.peak_equity, 1e-9)):.2%} | {progress:.4f}% | eps {epsilon:.3f}"
+                f"| DD {(1 - env.equity / max(env.peak_equity, 1e-9)):.2%} | WR {env._current_win_rate():.1%} "
+                f"| RiskMul {env._edge_risk_multiplier():.2f} | {progress:.4f}% | eps {epsilon:.3f}"
             )
 
         if done:
