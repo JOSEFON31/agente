@@ -78,9 +78,19 @@ os.makedirs(CFG.model_dir, exist_ok=True)
 
 def getenv_required(name: str) -> str:
     value = os.getenv(name)
-    if not value:
+    if value is None:
         raise RuntimeError(f"Missing required env var: {name}")
+    value = value.strip()
+    if not value:
+        raise RuntimeError(f"Env var is empty: {name}")
     return value
+
+
+def load_binance_credentials() -> tuple[str, str]:
+    """Load and validate Binance credentials from environment variables."""
+    api_key = getenv_required("BINANCE_API_KEY")
+    api_secret = getenv_required("BINANCE_API_SECRET")
+    return api_key, api_secret
 
 
 def sync_binance_time(client: Client) -> None:
@@ -352,8 +362,7 @@ def select_action(model: nn.Module, state: np.ndarray, eps: float) -> int:
 
 
 def main() -> None:
-    api_key = getenv_required("BINANCE_API_KEY")
-    api_secret = getenv_required("BINANCE_API_SECRET")
+    api_key, api_secret = load_binance_credentials()
 
     client = Client(api_key, api_secret, testnet=True, requests_params={"timeout": 30})
     sync_binance_time(client)
