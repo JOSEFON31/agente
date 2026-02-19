@@ -81,6 +81,7 @@ class Config:
     balance_refresh_steps: int = 5
     train_updates_per_step: int = 4
     log_every_n_steps: int = 5
+    idle_heartbeat_cycles: int = 20
 
 
 CFG = Config()
@@ -258,6 +259,7 @@ class TradingEnv:
         self.total_profit = 0.0
         self.daily_stop = False
         self.prev_equity = self.initial_equity
+        self.has_processed_live_bar = False
 
     def _fetch(self, limit: int) -> pd.DataFrame:
         klines = safe_api_call(self.client, self.client.get_klines, symbol=CFG.symbol, interval=CFG.interval, limit=limit)
@@ -293,7 +295,7 @@ class TradingEnv:
         new_ts = int(new.iloc[-1].t)
 
         if new_ts <= last_ts:
-            # Same in-progress candle: refresh equity only, avoid duplicated transitions.
+            # Same in-progress candle: refresh equity. Process once at startup to avoid "frozen" first minute.
             last_price = float(self.df.iloc[-1].close)
             self.equity = self._equity(last_price)
             self.total_profit = self.equity - self.initial_equity
@@ -301,6 +303,10 @@ class TradingEnv:
             drawdown = 1 - (self.equity / self.peak_equity)
             if drawdown >= CFG.max_daily_drawdown:
                 self.daily_stop = True
+
+            if not self.has_processed_live_bar:
+                self.has_processed_live_bar = True
+                return True
             return False
 
         self.df = pd.concat([self.df, new]).tail(CFG.history_bars).reset_index(drop=True)
@@ -541,13 +547,19 @@ def main() -> None:
 
     print(f"🚀 RL Trader running on {DEVICE} | target equity ${CFG.target_equity:,.2f}")
 
+    idle_cycles = 0
     while True:
         action = select_action(model, state, epsilon)
         next_state, reward, done, advanced = env.step(action)
 
         if not advanced:
+            idle_cycles += 1
+            if idle_cycles % max(CFG.idle_heartbeat_cycles, 1) == 0:
+                print(f"⏳ Waiting for next {CFG.interval} candle... idle={idle_cycles}")
             time.sleep(CFG.idle_sleep_seconds)
             continue
+
+        idle_cycles = 0
 
         memory.push(state, action, reward, next_state, float(done))
         state = next_state
