@@ -71,6 +71,7 @@ class Config:
     # Runtime
     target_equity: float = float(os.getenv("TARGET_EQUITY", "10000000"))
     model_dir: str = "models"
+    warm_start_model_path: str = os.getenv("WARM_START_MODEL_PATH", "")
     sleep_seconds: float = 0.8
     idle_sleep_seconds: float = 0.25
 
@@ -423,6 +424,30 @@ def load_checkpoint_compatible(model: nn.Module, checkpoint_path: str) -> tuple[
     return len(compatible), skipped
 
 
+
+
+def resolve_warm_start_checkpoint(model_dir: str) -> Optional[str]:
+    """Resolve best checkpoint path for warm-start.
+
+    Priority:
+      1) CFG.warm_start_model_path (if exists)
+      2) models/dqn_offline_final.pt
+      3) latest .pt in model_dir
+    """
+    if CFG.warm_start_model_path:
+        if os.path.exists(CFG.warm_start_model_path):
+            return CFG.warm_start_model_path
+        print(f"⚠ WARM_START_MODEL_PATH not found: {CFG.warm_start_model_path}")
+
+    preferred = os.path.join(model_dir, "dqn_offline_final.pt")
+    if os.path.exists(preferred):
+        return preferred
+
+    checkpoints = sorted([f for f in os.listdir(model_dir) if f.endswith(".pt")])
+    if not checkpoints:
+        return None
+    return os.path.join(model_dir, checkpoints[-1])
+
 def select_action(model: nn.Module, state: np.ndarray, eps: float) -> int:
     if random.random() < eps:
         return random.randrange(CFG.action_dim)
@@ -440,14 +465,13 @@ def main() -> None:
     model = DuelingDQN(CFG.state_dim, CFG.action_dim).to(DEVICE)
     target_model = DuelingDQN(CFG.state_dim, CFG.action_dim).to(DEVICE)
 
-    checkpoints = sorted([f for f in os.listdir(CFG.model_dir) if f.endswith(".pt")])
-    if checkpoints:
-        latest = os.path.join(CFG.model_dir, checkpoints[-1])
+    checkpoint_path = resolve_warm_start_checkpoint(CFG.model_dir)
+    if checkpoint_path:
         try:
-            loaded, skipped = load_checkpoint_compatible(model, latest)
-            print(f"✅ Loaded checkpoint: {latest} | tensors loaded={loaded}, skipped={skipped}")
+            loaded, skipped = load_checkpoint_compatible(model, checkpoint_path)
+            print(f"✅ Loaded checkpoint: {checkpoint_path} | tensors loaded={loaded}, skipped={skipped}")
         except Exception as exc:
-            print(f"⚠ Failed to load checkpoint ({latest}), continuing with fresh weights: {exc}")
+            print(f"⚠ Failed to load checkpoint ({checkpoint_path}), continuing with fresh weights: {exc}")
 
     target_model.load_state_dict(model.state_dict())
     optimizer = optim.AdamW(model.parameters(), lr=CFG.lr)
