@@ -52,7 +52,7 @@ class Config:
     interval: str = Client.KLINE_INTERVAL_1MINUTE
     history_bars: int = 300
     taker_fee: float = 0.001
-    take_profit: float = 0.010
+    take_profit: float = 0.009
     stop_loss: float = -0.012
     max_hold_steps: int = 25
     min_order_usdt: float = 10.0
@@ -63,15 +63,15 @@ class Config:
     max_position_notional: float = 0.40  # max 40% of equity
     max_daily_drawdown: float = 0.05
     cooldown_steps_after_loss: int = 3
-    min_net_profit_pct_to_exit: float = 0.0025  # ~0.25% net target to beat fee drag
-    min_hold_steps: int = 3
-    post_sell_cooldown_steps: int = 4
-    min_entry_atr_pct: float = 0.0012
-    min_entry_trend: float = 0.00012
-    min_entry_rsi: float = 0.52
-    min_entry_volume_z: float = -0.10
-    min_win_rate_for_full_risk: float = 0.55
-    low_edge_risk_multiplier: float = 0.55
+    min_net_profit_pct_to_exit: float = 0.0020  # ~0.20% net target to balance fees vs frequency
+    min_hold_steps: int = 2
+    post_sell_cooldown_steps: int = 2
+    min_entry_atr_pct: float = 0.0008
+    min_entry_trend: float = 0.00005
+    min_entry_rsi: float = 0.50
+    min_entry_volume_z: float = -0.40
+    min_win_rate_for_full_risk: float = 0.52
+    low_edge_risk_multiplier: float = 0.70
 
     # Rewards
     hold_penalty: float = -0.00015
@@ -92,6 +92,8 @@ class Config:
     train_updates_per_step: int = 4
     log_every_n_steps: int = 5
     idle_heartbeat_cycles: int = 20
+    no_trade_relax_after_steps: int = 18
+    aggressive_entry_bonus_prob: float = 0.18
 
 
 CFG = Config()
@@ -273,6 +275,7 @@ class TradingEnv:
         self.has_processed_live_bar = False
         self.recent_trade_results = deque(maxlen=40)
         self.recent_equity_returns = deque(maxlen=120)
+        self.no_trade_steps = 0
 
     def _fetch(self, limit: int) -> pd.DataFrame:
         klines = safe_api_call(self.client, self.client.get_klines, symbol=CFG.symbol, interval=CFG.interval, limit=limit)
@@ -423,6 +426,7 @@ class TradingEnv:
             return self.state(), -1.0, True, True
 
         if not self.in_position:
+            self.no_trade_steps += 1
             reward += CFG.inaction_penalty
             if self.loss_cooldown > 0:
                 self.loss_cooldown -= 1
@@ -432,14 +436,27 @@ class TradingEnv:
         trend = (float(row.ema_fast) - float(row.ema_slow)) / max(price, 1e-9)
         rsi = float(row.rsi) / 100.0
         volume_z = float(row.volume_z)
+
+        relax_mode = self.no_trade_steps >= CFG.no_trade_relax_after_steps
+        atr_gate = CFG.min_entry_atr_pct * (0.75 if relax_mode else 1.0)
+        trend_gate = CFG.min_entry_trend * (0.60 if relax_mode else 1.0)
+        rsi_gate = CFG.min_entry_rsi - (0.02 if relax_mode else 0.0)
+        vol_gate = CFG.min_entry_volume_z - (0.20 if relax_mode else 0.0)
+
         entry_signal_ok = (
-            (atr_pct >= CFG.min_entry_atr_pct)
-            and (trend >= CFG.min_entry_trend)
-            and (rsi >= CFG.min_entry_rsi)
-            and (volume_z >= CFG.min_entry_volume_z)
+            (atr_pct >= atr_gate)
+            and (trend >= trend_gate)
+            and (rsi >= rsi_gate)
+            and (volume_z >= vol_gate)
         )
 
-        if (not self.in_position) and action == 1 and self.loss_cooldown == 0 and self.trade_cooldown == 0 and entry_signal_ok:
+        aggressive_explore = (
+            relax_mode
+            and random.random() < (CFG.aggressive_entry_bonus_prob * max(epsilon, 0.05))
+            and trend > 0
+        )
+
+        if (not self.in_position) and action == 1 and self.loss_cooldown == 0 and self.trade_cooldown == 0 and (entry_signal_ok or aggressive_explore):
             usdt = self.usdt_balance
             size_usdt = min(usdt, self._risk_position_size_usdt(price, atr_pct))
             if size_usdt >= CFG.min_order_usdt:
@@ -452,6 +469,7 @@ class TradingEnv:
                 self.btc_balance += qty
                 self.in_position = True
                 self.hold_steps = 0
+                self.no_trade_steps = 0
                 print(f"🟢 BUY {qty:.6f} BTC @ ${price:,.2f} | Notional ${cost:,.2f}")
 
         if self.in_position and self.entry:
